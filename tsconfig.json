@@ -12,7 +12,8 @@
     "paths": {
       "@/*": ["./src/*"]
     },
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "useUnknownInCatchVariables": false
   },
-  "include": ["src", "test"]
+  "include": ["src", "test", "index.tsx"]
 }
