@@ -1,59 +1,95 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "url";
 import express from "express";
-import { createServer as createViteServer } from "vite";
-import fs from "fs";
-import path from "path";
-const __dirname = path.resolve();
 
-async function createServer() {
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const isTest = process.env.NODE_ENV === "test" || !!process.env.VITE_TEST_BUILD;
+
+export async function createServer(
+  root = process.cwd(),
+  isProd = process.env.NODE_ENV === "production",
+  hmrPort
+) {
+  const resolve = (p) => path.resolve(__dirname, p);
+
+  const indexProd = isProd
+    ? fs.readFileSync(resolve("dist/client/index.html"), "utf-8")
+    : "";
+
   const app = express();
 
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    //@ts-ignore
-    appType: "custom",
-  });
+  /**
+   * @type {import('vite').ViteDevServer}
+   */
+  let vite;
+  if (!isProd) {
+    vite = await (
+      await import("vite")
+    ).createServer({
+      root,
+      logLevel: isTest ? "error" : "info",
+      server: {
+        middlewareMode: true,
+        watch: {
+          usePolling: true,
+          interval: 100,
+        },
+        hmr: {
+          port: hmrPort,
+        },
+      },
+      appType: "custom",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use((await import("compression")).default());
+    app.use(
+      (await import("serve-static")).default(resolve("dist/client"), {
+        index: false,
+      })
+    );
+  }
 
-  app.use(vite.middlewares);
-
-  app.use("*", async (req, res, next) => {
-    const url = req.originalUrl;
-
+  app.use("*", async (req, res) => {
     try {
-      // 1. Read index.html
-      let template = fs.readFileSync(
-        path.resolve(__dirname, "index.html"),
-        "utf-8"
-      );
+      const url = req.originalUrl;
 
-      // 2. Apply Vite HTML transforms. This injects the Vite HMR client, and
-      //    also applies HTML transforms from Vite plugins, e.g. global preambles
-      //    from @vitejs/plugin-react
-      template = await vite.transformIndexHtml(url, template);
+      let template, render;
+      if (!isProd) {
+        template = fs.readFileSync(resolve("index.html"), "utf-8");
+        template = await vite.transformIndexHtml(url, template);
+        render = (await vite.ssrLoadModule("/src/entry-server.tsx")).AppSSR;
+      } else {
+        template = indexProd;
+        render = (await import("./dist/server/entry-server.js")).AppSSR;
+      }
 
-      // 3. Load the server entry. vite.ssrLoadModule automatically transforms
-      //    your ESM source code to be usable in Node.js! There is no bundling
-      //    required, and provides efficient invalidation similar to HMR.
-      const { AppSSR } = await vite.ssrLoadModule("/src/entry-server.tsx");
+      const context = {};
+      const appHtml = render(url, context);
 
-      // 4. render the app HTML. This assumes entry-server.js's exported `render`
-      //    function calls appropriate framework SSR APIs,
-      //    e.g. ReactDOMServer.renderToString()
-      const appHtml = await AppSSR(url);
+      if (context.url) {
+        return res.redirect(301, context.url);
+      }
 
-      // 5. Inject the app-rendered HTML into the template.
-      const html = template.replace(`<!--ssr-outlet-->`, appHtml);
+      const html = template.replace(`<!--app-html-->`, appHtml);
 
-      // 6. Send the rendered HTML back.
       res.status(200).set({ "Content-Type": "text/html" }).end(html);
     } catch (e) {
-      // If an error is caught, let Vite fix the stack trace so it maps back to
-      // your actual source code.
-      vite.ssrFixStacktrace(e);
-      next(e);
+      !isProd && vite.ssrFixStacktrace(e);
+      console.log(e.stack);
+      res.status(500).end(e.stack);
     }
   });
 
-  app.listen(3001);
+  return { app, vite };
 }
 
-createServer();
+if (!isTest) {
+  createServer().then(({ app }) =>
+    app.listen(3001, () => {
+      console.log("http://localhost:3001");
+    })
+  );
+}
